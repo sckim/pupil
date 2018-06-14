@@ -15,12 +15,12 @@ from glob import glob
 import cv2
 import numpy as np
 from pyglui import ui
-from glfw import glfwGetCursorPos, glfwGetFramebufferSize, glfwGetWindowSize, glfwGetCurrentContext
+from glfw import glfwGetCursorPos, glfwGetFramebufferSize, glfwGetWindowSize, glfwGetCurrentContext, getHDPIFactor
 
 from plugin import Visualizer_Plugin_Base
 from player_methods import transparent_image_overlay
 from methods import normalize, denormalize
-from video_capture import EndofVideoFileError, FileCaptureError, File_Source
+from video_capture import EndofVideoError, File_Source
 
 # logging
 import logging
@@ -61,9 +61,9 @@ class Eye_Wrapper(object):
     def initliaze_video(self, rec_dir, world_timestamps):
         eye_loc = os.path.join(rec_dir, 'eye{}.*'.format(self.eyeid))
         try:
-            self.source = File_Source(Empty(), source_path=glob(eye_loc)[0])
+            self.source = File_Source(Empty(), source_path=glob(eye_loc)[0], timing=None)
             self.current_eye_frame = self.source.get_frame()
-        except (FileNotFoundError, IndexError, FileCaptureError):
+        except (FileNotFoundError, IndexError):
             logger.warning('Video for eye{} was not found or could not be opened.'.format(self.eyeid))
         else:
             self.eye_world_frame_map = correlate_eye_world(self.source.timestamps, world_timestamps)
@@ -107,11 +107,11 @@ class Eye_Wrapper(object):
                 # if we just need to seek by one frame, its faster to just read one and and throw it away.
                 self.source.get_frame()
             if requested_eye_frame_idx != self.source.get_frame_index() + 1:
-                self.source.seek_to_frame(requested_eye_frame_idx)
+                self.source.seek_to_frame(int(requested_eye_frame_idx))
 
             try:
                 self.current_eye_frame = self.source.get_frame()
-            except EndofVideoFileError:
+            except EndofVideoError:
                 logger.info("Reached the end of the eye video for eye video {}.".format(self.eyeid))
 
         # 2. dragging image
@@ -212,7 +212,7 @@ class Vis_Eye_Video_Overlay(Visualizer_Plugin_Base):
 
         if self.g_pool.app != 'exporter':
             window = g_pool.main_window
-            self.hdpi_factor = float(glfwGetFramebufferSize(window)[0] / glfwGetWindowSize(window)[0])
+            self.hdpi_factor = getHDPIFactor(window)
         else:
             self.hdpi_factor = 1.
 

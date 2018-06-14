@@ -40,7 +40,7 @@ class Empty(object):
         pass
 
 
-def setup_fake_pool(frame_size, intrinsics, detection_mode, rec_dir):
+def setup_fake_pool(frame_size, intrinsics, detection_mode, rec_dir, min_calibration_confidence):
     cap = Empty()
     cap.frame_size = frame_size
     cap.intrinsics = intrinsics
@@ -48,6 +48,7 @@ def setup_fake_pool(frame_size, intrinsics, detection_mode, rec_dir):
     pool.capture = cap
     pool.get_timestamp = time
     pool.detection_mapping_mode = detection_mode
+    pool.min_calibration_confidence = min_calibration_confidence
     pool.rec_dir = rec_dir
     pool.app = 'player'
     return pool
@@ -121,11 +122,11 @@ class Gaze_From_Recording(Gaze_Producer_Base):
 
     def _set_offset_x(self, offset_x):
         self.x_offset = offset_x
-        self.notify_all({'subject': 'manual_gaze_correction.offset_changed', 'delay': .5})
+        self.notify_all({'subject': 'manual_gaze_correction.offset_changed', 'delay': 1.})
 
     def _set_offset_y(self, offset_y):
         self.y_offset = offset_y
-        self.load_data_with_offset()
+        self.notify_all({'subject': 'manual_gaze_correction.offset_changed', 'delay': 1.})
 
     def on_notify(self, notification):
         if notification['subject'] == 'manual_gaze_correction.offset_changed':
@@ -180,6 +181,8 @@ def calibrate_and_map(g_pool, ref_list, calib_list, map_list, x_offset, y_offset
         progress = "Mapping complete."
         yield progress, []
     else:
+        # logger does not work here, because we are in a subprocess
+        print('Calibration failed: {}'.format(result['reason']))
         yield "calibration failed", []
 
 
@@ -199,7 +202,7 @@ def make_section_dict(calib_range, map_range):
 
 
 class Offline_Calibration(Gaze_Producer_Base):
-    session_data_version = 7
+    session_data_version = 8
 
     def __init__(self, g_pool, manual_ref_edit_mode=False):
         super().__init__(g_pool)
@@ -215,11 +218,10 @@ class Offline_Calibration(Gaze_Producer_Base):
             if session_data['version'] != self.session_data_version:
                 logger.warning("Session data from old version. Will not use this.")
                 assert False
-        except Exception as e:
-            map_range = [0, len(self.g_pool.timestamps)]
-            calib_range = [len(self.g_pool.timestamps)//10, len(self.g_pool.timestamps)//2]
+        except (AssertionError, FileNotFoundError):
             session_data = {}
-            session_data['sections'] = [make_section_dict(calib_range, map_range), ]
+            max_idx = len(self.g_pool.timestamps) - 1
+            session_data['sections'] = [make_section_dict((0, max_idx), (0, max_idx))]
             session_data['circle_marker_positions'] = []
             session_data['manual_ref_positions'] = []
         self.sections = session_data['sections']
@@ -234,9 +236,8 @@ class Offline_Calibration(Gaze_Producer_Base):
             self.detection_progress = 0.0
 
     def append_section(self):
-        map_range = [0, len(self.g_pool.timestamps)]
-        calib_range = [len(self.g_pool.timestamps)//10, len(self.g_pool.timestamps)//2]
-        sec = make_section_dict(calib_range, map_range)
+        max_idx = len(self.g_pool.timestamps) - 1
+        sec = make_section_dict((0, max_idx), (0, max_idx))
         self.sections.append(sec)
         if self.menu is not None:
             self.append_section_menu(sec)
@@ -247,7 +248,7 @@ class Offline_Calibration(Gaze_Producer_Base):
 
         self.glfont = fontstash.Context()
         self.glfont.add_font('opensans', ui.get_opensans_font_path())
-        self.glfont.set_color_float((1., 1., 1., .8))
+        self.glfont.set_color_float((1., 1., 1., 1.))
         self.glfont.set_align_string(v_align='right', h_align='top')
 
         def use_as_natural_features():
@@ -259,8 +260,8 @@ class Offline_Calibration(Gaze_Producer_Base):
             current = self.g_pool.capture.get_frame_index()
             for nf in self.manual_ref_positions:
                 if nf['index'] > current:
-                    self.g_pool.capture.seek_to_frame(nf['index'])
-                    self.g_pool.new_seek = True
+                    self.notify_all({'subject': 'seek_control.should_seek',
+                                     'index': nf['index']})
                     return
             logger.error('No further natural feature available')
 
@@ -283,6 +284,12 @@ class Offline_Calibration(Gaze_Producer_Base):
         self.menu.append(ui.Button('Jump to next natural feature', jump_next_natural_feature))
         self.menu.append(ui.Switch('manual_ref_edit_mode', self, label="Natural feature edit mode"))
         self.menu.append(ui.Button('Clear natural features', clear_natural_features))
+
+        self.menu.append(ui.Info_Text('Calibration only considers pupil data that has an equal or higher confidence than the minimum calibration confidence.'))
+        self.menu.append(ui.Slider('min_calibration_confidence', self.g_pool,
+                                   step=.01, min=0.0, max=1.0,
+                                   label='Minimum calibration confidence'))
+
         self.menu.append(ui.Button('Add section', self.append_section))
 
         # set to minimum height
@@ -325,23 +332,51 @@ class Offline_Calibration(Gaze_Producer_Base):
 
         def make_remove_fn(sec):
             def remove():
-                del self.menu[self.sections.index(sec)-len(self.sections)]
+                del self.menu[self.sections.index(sec) - len(self.sections)]
                 del self.sections[self.sections.index(sec)]
                 self.correlate_and_publish()
 
             return remove
+
+        def set_trim_fn(button, sec, key):
+            def trim(format_only=False):
+                if format_only:
+                    left_idx, right_idx = sec[key]
+                else:
+                    right_idx = self.g_pool.seek_control.trim_right
+                    left_idx = self.g_pool.seek_control.trim_left
+                    sec[key] = left_idx, right_idx
+
+                time_fmt = key.replace('_', ' ').split(' ')[0].title() + ': '
+                min_ts = self.g_pool.timestamps[0]
+                for idx in (left_idx, right_idx):
+                    ts = self.g_pool.timestamps[idx] - min_ts
+                    minutes = ts // 60
+                    seconds = ts - (minutes * 60.)
+                    time_fmt += ' {:02.0f}:{:02.0f} -'.format(abs(minutes), seconds)
+                button.outer_label = time_fmt[:-2]  # remove final ' -'
+            button.function = trim
 
         section_menu.append(ui.Text_Input('label', sec, label='Label'))
         section_menu.append(ui.Selector('calibration_method', sec,
                                         label="Calibration Method",
                                         labels=['Circle Marker', 'Natural Features'],
                                         selection=['circle_marker', 'natural_features']))
-        section_menu.append(ui.Selector('mapping_method', sec, label='Calibration Mode',selection=['2d','3d']))
+        section_menu.append(ui.Selector('mapping_method', sec, label='Calibration Mode',selection=['2d', '3d']))
         section_menu.append(ui.Text_Input('status', sec, label='Calibration Status', setter=lambda _: _))
-        section_menu.append(ui.Text_Input('calibration_range', sec, label='Calibration range',
-                                          setter=make_validate_fn(sec, 'calibration_range')))
-        section_menu.append(ui.Text_Input('mapping_range', sec, label='Mapping range',
-                                          setter=make_validate_fn(sec, 'mapping_range')))
+
+        section_menu.append(ui.Info_Text('This section is calibrated using reference markers found in a user set range "Calibration". The calibration is used to map pupil to gaze positions within a user set range "Mapping". Drag trim marks in the timeline to set a range and apply it.'))
+
+        calib_range_button = ui.Button('Set from trim marks', None)
+        set_trim_fn(calib_range_button, sec, 'calibration_range')
+        calib_range_button.function(format_only=True)  # set initial label
+        section_menu.append(calib_range_button)
+
+        mapping_range_button = ui.Button('Set from trim marks', None)
+        set_trim_fn(mapping_range_button, sec, 'mapping_range')
+        mapping_range_button.function(format_only=True)  # set initial label
+        section_menu.append(mapping_range_button)
+
         section_menu.append(ui.Button('Recalibrate', make_calibrate_fn(sec)))
         section_menu.append(ui.Button('Remove section', make_remove_fn(sec)))
 
@@ -410,17 +445,17 @@ class Offline_Calibration(Gaze_Producer_Base):
                 recent = [d for d in sec["bg_task"].fetch()]
                 if recent:
                     progress, data = zip(*recent)
-                    sec['gaze_positions'].extend(chain(*data))
+                    sec['gaze_positions'].extend(chain.from_iterable(data))
                     sec['status'] = progress[-1]
                 if sec["bg_task"].completed:
                     self.correlate_and_publish()
                     sec['bg_task'] = None
 
     def correlate_and_publish(self):
-        all_gaze = list(chain(*[s['gaze_positions'] for s in self.sections]))
+        all_gaze = list(chain.from_iterable((s['gaze_positions'] for s in self.sections)))
         self.g_pool.gaze_positions = sorted(all_gaze, key=lambda d: d['timestamp'])
         self.g_pool.gaze_positions_by_frame = correlate_data(self.g_pool.gaze_positions, self.g_pool.timestamps)
-        self.notify_all({'subject': 'gaze_positions_changed','delay':1})
+        self.notify_all({'subject': 'gaze_positions_changed', 'delay':1})
 
     def calibrate_section(self, sec):
         if sec['bg_task']:
@@ -429,13 +464,18 @@ class Offline_Calibration(Gaze_Producer_Base):
         sec['status'] = 'Starting calibration' # This will be overwritten on success
         sec['gaze_positions'] = []  # reset interim buffer for given section
 
-        calib_list = list(chain(*self.g_pool.pupil_positions_by_frame[slice(*sec['calibration_range'])]))
-        map_list = list(chain(*self.g_pool.pupil_positions_by_frame[slice(*sec['mapping_range'])]))
+        calib_list = list(chain.from_iterable(self.g_pool.pupil_positions_by_frame[slice(*sec['calibration_range'])]))
+        map_list = list(chain.from_iterable(self.g_pool.pupil_positions_by_frame[slice(*sec['mapping_range'])]))
 
         if sec['calibration_method'] == 'circle_marker':
-            ref_list = [r for r in self.circle_marker_positions if sec['calibration_range'][0] <= r['index'] <= sec['calibration_range'][1]]
+            ref_list = self.circle_marker_positions
         elif sec['calibration_method'] == 'natural_features':
             ref_list = self.manual_ref_positions
+
+        start = sec['calibration_range'][0]
+        end = sec['calibration_range'][1]
+        ref_list = [r for r in ref_list if start <= r['index'] <= end]
+
         if not calib_list:
             logger.error('No pupil data to calibrate section "{}"'.format(self.sections.index(sec) + 1))
             sec['status'] = 'calibration failed'
@@ -451,11 +491,14 @@ class Offline_Calibration(Gaze_Producer_Base):
             logger.warning("Pupil data is 2d, calibration and mapping mode forced to 2d.")
             sec["mapping_method"] = '2d'
 
-        fake = setup_fake_pool(self.g_pool.capture.frame_size, self.g_pool.capture.intrinsics,
-                               detection_mode=sec["mapping_method"], rec_dir=self.g_pool.rec_dir)
+        fake = setup_fake_pool(self.g_pool.capture.frame_size,
+                               self.g_pool.capture.intrinsics,
+                               sec["mapping_method"],
+                               self.g_pool.rec_dir,
+                               self.g_pool.min_calibration_confidence)
         generator_args = (fake, ref_list, calib_list, map_list, sec['x_offset'], sec['y_offset'])
 
-        logger.info('Calibrating "{}" in {} mode...'.format(self.sections.index(sec) + 1, sec["mapping_method"]))
+        logger.info('Calibrating section {} ({}) in {} mode...'.format(self.sections.index(sec) + 1, sec['label'], sec["mapping_method"]))
         sec['bg_task'] = bh.Task_Proxy('{}'.format(self.sections.index(sec) + 1), calibrate_and_map, args=generator_args)
 
     def gl_display(self):
@@ -486,7 +529,7 @@ class Offline_Calibration(Gaze_Producer_Base):
                     draw_points([mr['norm_pos']], size=5, color=RGBA(.0, .9, 0.0, alpha))
 
         # calculate correct timeline height. Triggers timeline redraw only if changed
-        self.timeline.height = max(0.001, self.timeline_line_height * len(self.sections))
+        self.timeline.content_height = max(0.001, self.timeline_line_height * len(self.sections))
 
     def draw_sections(self, width, height, scale):
         t0, t1 = self.g_pool.timestamps[0], self.g_pool.timestamps[-1]
@@ -494,28 +537,37 @@ class Offline_Calibration(Gaze_Producer_Base):
         with gl_utils.Coord_System(t0, t1, height, 0):
             gl.glTranslatef(0, 0.001 + scale * self.timeline_line_height / 2, 0)
             for s in self.sections:
-                color = RGBA(1., 1., 1., .5)
-                if s['calibration_method'] == "natural_features":
-                    draw_x([(m['timestamp'], 0) for m in self.manual_ref_positions],
-                           height=12, width=3 * pixel_to_time_fac, thickness=scale, color=color)
-                else:
-                    draw_bars([(m['timestamp'], 0) for m in self.circle_marker_positions],
-                              height=12, thickness=scale, color=color)
                 cal_slc = slice(*s['calibration_range'])
                 map_slc = slice(*s['mapping_range'])
                 cal_ts = self.g_pool.timestamps[cal_slc]
                 map_ts = self.g_pool.timestamps[map_slc]
 
+                color = RGBA(*s['color'][:3], 1.)
+                if len(cal_ts):
+                    draw_rounded_rect((cal_ts[0], -4 * scale),
+                                      (cal_ts[-1] - cal_ts[0], 8 * scale),
+                                      corner_radius=0,
+                                      color=color,
+                                      sharpness=1.)
+                if len(map_ts):
+                    draw_rounded_rect((map_ts[0], -scale),
+                                      (map_ts[-1] - map_ts[0], 2 * scale),
+                                      corner_radius=0,
+                                      color=color,
+                                      sharpness=1.)
 
-                color = RGBA(*s['color'])
-                draw_polyline([(cal_ts[0], 0), (cal_ts[-1], 0)], color=color,
-                              line_type=gl.GL_LINES, thickness=8*scale)
-                draw_polyline([(map_ts[0], 0), (map_ts[-1], 0)], color=color,
-                              line_type=gl.GL_LINES, thickness=2*scale)
+                color = RGBA(1., 1., 1., .5)
+                if s['calibration_method'] == "natural_features":
+                    draw_x([(m['timestamp'], 0) for m in self.manual_ref_positions],
+                           height=12 * scale, width=3 * pixel_to_time_fac / scale, thickness=scale, color=color)
+                else:
+                    draw_bars([(m['timestamp'], 0) for m in self.circle_marker_positions],
+                              height=12 * scale, thickness=scale, color=color)
+
                 gl.glTranslatef(0, scale * self.timeline_line_height, 0)
 
     def draw_labels(self, width, height, scale):
-        self.glfont.set_size(self.timeline_line_height * .8 * scale)
+        self.glfont.set_size(self.timeline_line_height * scale)
         for idx, s in enumerate(self.sections):
             self.glfont.draw_text(width, 0, s['label'])
             gl.glTranslatef(0, self.timeline_line_height * scale, 0)
@@ -527,9 +579,9 @@ class Offline_Calibration(Gaze_Producer_Base):
             self.start_marker_detection()
 
     def start_marker_detection(self):
-        self.process_pipe = zmq_tools.Msg_Pair_Server(self.g_pool.zmq_ctx)
         self.circle_marker_positions = []
         source_path = self.g_pool.capture.source_path
+        self.process_pipe = zmq_tools.Msg_Pair_Server(self.g_pool.zmq_ctx)
         self.notify_all({'subject': 'circle_detector_process.should_start',
                          'source_path': source_path, "pair_url": self.process_pipe.url})
 

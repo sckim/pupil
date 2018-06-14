@@ -56,7 +56,7 @@ class Blink_Detection(Analysis_Plugin_Base):
     def init_ui(self):
         self.add_menu()
         self.menu.label = 'Blink Detector'
-        self.menu.append(ui.Info_Text('This plugin detects blink on- and offsets based on confidence drops.'))
+        self.menu.append(ui.Info_Text('This plugin detects blink onsets and offsets based on confidence drops.'))
         self.menu.append(ui.Switch('visualize', self, label='Visualize'))
         self.menu.append(ui.Slider('history_length', self,
                                    label='Filter length [seconds]',
@@ -90,6 +90,9 @@ class Blink_Detection(Analysis_Plugin_Base):
         activity = np.fromiter((pp['confidence'] for pp in self.history), dtype=float)
         blink_filter = np.ones(filter_size) / filter_size
         blink_filter[filter_size // 2:] *= -1
+
+        if filter_size % 2 == 1:  # make filter symmetrical
+            blink_filter[filter_size // 2] = 0.
 
         # The theoretical response maximum is +-0.5
         # Response of +-0.45 seems sufficient for a confidence of 1.
@@ -144,6 +147,7 @@ class Offline_Blink_Detection(Blink_Detection):
         self.timestamps = []
         g_pool.blinks = []
         g_pool.blinks_by_frame = [[] for x in self.g_pool.timestamps]
+        self.cache = {'response_points': (), 'class_points': (), 'thresholds': ()}
 
     def init_ui(self):
         super().init_ui()
@@ -151,7 +155,7 @@ class Offline_Blink_Detection(Blink_Detection):
         self.glfont.add_font('opensans', ui.get_opensans_font_path())
         self.glfont.set_font('opensans')
         self.timeline = ui.Timeline('Blink Detection', self.draw_activation, self.draw_legend)
-        self.timeline.height *= 1.5
+        self.timeline.content_height *= 2
         self.g_pool.user_timelines.append(self.timeline)
 
     def deinit_ui(self):
@@ -172,6 +176,7 @@ class Offline_Blink_Detection(Blink_Detection):
             logger.info('Pupil postions changed. Recalculating.')
             self.recalculate()
         elif notification['subject'] == 'blinks_changed':
+            self.cache_activation()
             self.timeline.refresh()
         elif notification['subject'] == "should_export":
             self.export(notification['range'], notification['export_dir'])
@@ -199,7 +204,7 @@ class Offline_Blink_Detection(Blink_Detection):
                   'filter_response', 'base_data')
 
         start, end = export_range
-        blinks_in_section = [b for b in self.g_pool.blinks if start <= b['index'] <= end]
+        blinks_in_section = [b for b in self.g_pool.blinks if start <= b['index'] < end]
 
         with open(os.path.join(export_dir, 'blinks.csv'), 'w',
                   encoding='utf-8', newline='') as csvfile:
@@ -225,12 +230,13 @@ class Offline_Blink_Detection(Blink_Detection):
             self.filter_response = []
             self.response_classification = []
             self.timestamps = []
+            self.consolidate_classifications()
             return
 
         conf_iter = (pp['confidence'] for pp in all_pp)
         activity = np.fromiter(conf_iter, dtype=float, count=len(all_pp))
         total_time = all_pp[-1]['timestamp'] - all_pp[0]['timestamp']
-        filter_size = round(len(all_pp) * self.history_length / total_time)
+        filter_size = 2 * round(len(all_pp) * self.history_length / total_time / 2.)
         blink_filter = np.ones(filter_size) / filter_size
 
         # This is different from the online filter. Convolution will flip
@@ -324,10 +330,16 @@ class Offline_Blink_Detection(Blink_Detection):
         self.g_pool.blinks_by_frame = blinks_by_frame
         self.notify_all({'subject': 'blinks_changed', 'delay': .2})
 
-    def draw_activation(self, width, height, scale):
+    def cache_activation(self):
         t0, t1 = self.g_pool.timestamps[0], self.g_pool.timestamps[-1]
-        response_points = tuple(zip(self.timestamps, self.filter_response))
-        if len(response_points) == 0:
+        self.cache['thresholds'] = ((t0, self.onset_confidence_threshold),
+                                    (t1, self.onset_confidence_threshold),
+                                    (t0, -self.offset_confidence_threshold),
+                                    (t1, -self.offset_confidence_threshold))
+
+        self.cache['response_points'] = tuple(zip(self.timestamps, self.filter_response))
+        if len(self.cache['response_points']) == 0:
+            self.cache['class_points'] = ()
             return
 
         class_points = deque([(t0, -.9)])
@@ -337,19 +349,17 @@ class Offline_Blink_Detection(Blink_Detection):
             class_points.append((b['end_timestamp'], .9))
             class_points.append((b['end_timestamp'], -.9))
         class_points.append((t1, -.9))
+        self.cache['class_points'] = tuple(class_points)
 
-        thresholds = [(t0, self.onset_confidence_threshold),
-                      (t1, self.onset_confidence_threshold),
-                      (t0, -self.offset_confidence_threshold),
-                      (t1, -self.offset_confidence_threshold)]
-
+    def draw_activation(self, width, height, scale):
+        t0, t1 = self.g_pool.timestamps[0], self.g_pool.timestamps[-1]
         with gl_utils.Coord_System(t0, t1, -1, 1):
-            draw_polyline(response_points, color=activity_color,
-                          line_type=gl.GL_LINE_STRIP, thickness=1*scale)
-            draw_polyline(class_points, color=blink_color,
-                          line_type=gl.GL_LINE_STRIP, thickness=1*scale)
-            draw_polyline(thresholds, color=threshold_color,
-                          line_type=gl.GL_LINES, thickness=1*scale)
+            draw_polyline(self.cache['response_points'], color=activity_color,
+                          line_type=gl.GL_LINE_STRIP, thickness=scale)
+            draw_polyline(self.cache['class_points'], color=blink_color,
+                          line_type=gl.GL_LINE_STRIP, thickness=scale)
+            draw_polyline(self.cache['thresholds'], color=threshold_color,
+                          line_type=gl.GL_LINES, thickness=scale)
 
     def draw_legend(self, width, height, scale):
         self.glfont.push_state()

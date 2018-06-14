@@ -26,6 +26,7 @@ import csv
 import numpy as np
 import cv2
 
+from bisect import bisect_left, bisect_right
 from scipy.spatial.distance import pdist
 from collections import deque
 from itertools import chain
@@ -82,7 +83,11 @@ def fixation_from_data(dispersion, method, base_data, timestamps=None):
 
 def vector_dispersion(vectors):
     distances = pdist(vectors, metric='cosine')
-    return np.arccos(1. - distances.max())
+    # use 20% biggest distances, but at least 4, see reasoning at
+    # https://github.com/pupil-labs/pupil/issues/1133#issuecomment-382412175
+    distances.sort()  # sort by distance
+    cut_off = np.max([distances.shape[0] // 5, 4])
+    return np.arccos(1. - distances[-cut_off:].mean())
 
 
 def gaze_dispersion(capture, gaze_subset, use_pupil=True):
@@ -99,7 +104,7 @@ def gaze_dispersion(capture, gaze_subset, use_pupil=True):
         eye_id = 1 if len(data[1]) > len(data[0]) else 0
         base_data = data[eye_id]
 
-        all_pp = chain(*(gp['base_data'] for gp in base_data))
+        all_pp = chain.from_iterable((gp['base_data'] for gp in base_data))
         pp_with_eye_id = (pp for pp in all_pp if pp['id'] == eye_id)
         vectors = np.array([pp['circle_3d']['normal'] for pp in pp_with_eye_id], dtype=np.float32)
     else:
@@ -113,9 +118,7 @@ def gaze_dispersion(capture, gaze_subset, use_pupil=True):
         locations[:, 1] = (1. - locations[:, 1]) * height
 
         # undistort onto 3d plane
-        undistorted = capture.intrinsics.undistortPoints(locations)
-        vectors = np.ones((undistorted.shape[0], 3), dtype=undistorted.dtype)
-        vectors[:, :-1] = undistorted
+        vectors = capture.intrinsics.unprojectPoints(locations)
 
     dist = vector_dispersion(vectors)
     return dist, method, base_data
@@ -208,7 +211,7 @@ class Offline_Fixation_Detector(Fixation_Detector_Base):
     visual angle within the coordinate system of the world camera. These
     fixations will have their method field set to "gaze".
     '''
-    def __init__(self, g_pool, max_dispersion=1.0, min_duration=300, max_duration=4000, show_fixations=True):
+    def __init__(self, g_pool, max_dispersion=3.0, min_duration=300, max_duration=1000, show_fixations=True):
         super().__init__(g_pool)
         # g_pool.min_data_confidence
         self.max_dispersion = max_dispersion
@@ -239,13 +242,26 @@ class Offline_Fixation_Detector(Fixation_Detector_Base):
             self.notify_all({'subject': 'fixation_detector.should_recalculate', 'delay': 1.})
 
         def jump_next_fixation(_):
-            ts = self.last_frame_ts
-            for f in self.g_pool.fixations:
-                if f['timestamp'] > ts:
-                    self.g_pool.capture.seek_to_frame(f['mid_frame_index'])
-                    self.g_pool.new_seek = True
-                    return
-            logger.error('No further fixation available')
+            cur_idx = self.last_frame_idx
+            all_idc = [f['mid_frame_index'] for f in self.g_pool.fixations]
+            if not all_idc:
+                logger.warning('No fixations available')
+                return
+            # wrap-around index
+            tar_fix = bisect_right(all_idc, cur_idx) % len(all_idc)
+            self.notify_all({'subject': 'seek_control.should_seek',
+                             'index': int(self.g_pool.fixations[tar_fix]['mid_frame_index'])})
+
+        def jump_prev_fixation(_):
+            cur_idx = self.last_frame_idx
+            all_idc = [f['mid_frame_index'] for f in self.g_pool.fixations]
+            if not all_idc:
+                logger.warning('No fixations available')
+                return
+            # wrap-around index
+            tar_fix = (bisect_left(all_idc, cur_idx) - 1) % len(all_idc)
+            self.notify_all({'subject': 'seek_control.should_seek',
+                             'index': int(self.g_pool.fixations[tar_fix]['mid_frame_index'])})
 
         for help_block in self.__doc__.split('\n\n'):
             help_str = help_block.replace('\n', ' ').replace('  ', '').strip()
@@ -254,26 +270,32 @@ class Offline_Fixation_Detector(Fixation_Detector_Base):
 
         self.menu.append(ui.Slider('max_dispersion', self, min=0.01, step=0.1, max=5.,
                                    label='Maximum Dispersion [degrees]', setter=set_max_dispersion))
-        self.menu.append(ui.Slider('min_duration', self, min=10, step=10, max=1500,
+        self.menu.append(ui.Slider('min_duration', self, min=10, step=10, max=4000,
                                    label='Minimum Duration [milliseconds]', setter=set_min_duration))
-        self.menu.append(ui.Slider('max_duration', self, min=10, step=10, max=1500,
+        self.menu.append(ui.Slider('max_duration', self, min=10, step=10, max=4000,
                                    label='Maximum Duration [milliseconds]', setter=set_max_duration))
         self.menu.append(ui.Text_Input('status', self, label='Detection progress:', setter=lambda x: None))
         self.menu.append(ui.Switch('show_fixations', self, label='Show fixations'))
         self.current_fixation_details = ui.Info_Text('')
         self.menu.append(self.current_fixation_details)
 
-        self.add_button = ui.Thumb('jump_next_fixation', setter=jump_next_fixation,
+        self.next_fix_button = ui.Thumb('jump_next_fixation', setter=jump_next_fixation,
                                    getter=lambda: False, label=chr(0xe044), hotkey='f',
                                    label_font='pupil_icons')
-        self.add_button.status_text = 'Next Fixation'
-        self.g_pool.quickbar.append(self.add_button)
+        self.next_fix_button.status_text = 'Next Fixation'
+        self.g_pool.quickbar.append(self.next_fix_button)
+
+        self.prev_fix_button = ui.Thumb('jump_prev_fixation', setter=jump_prev_fixation,
+                                   getter=lambda: False, label=chr(0xe045), hotkey='F',
+                                   label_font='pupil_icons')
+        self.prev_fix_button.status_text = 'Previous Fixation'
+        self.g_pool.quickbar.append(self.prev_fix_button)
 
     def deinit_ui(self):
         self.remove_menu()
         self.current_fixation_details = None
-        self.g_pool.quickbar.remove(self.add_button)
-        self.add_button = None
+        self.g_pool.quickbar.remove(self.next_fix_button)
+        self.next_fix_button = None
 
     def cleanup(self):
         if self.bg_task:
@@ -306,7 +328,7 @@ class Offline_Fixation_Detector(Fixation_Detector_Base):
         if self.bg_task:
             self.bg_task.cancel()
 
-        gaze_data = [gp for gp in self.g_pool.gaze_positions if gp['confidence'] > self.g_pool.min_data_confidence]
+        gaze_data = [gp for gp in self.g_pool.gaze_positions if gp['confidence'] >= self.g_pool.min_data_confidence]
         if not gaze_data:
             logger.error('No gaze data available to find fixations')
             self.status = 'Fixation detection failed'
@@ -327,7 +349,7 @@ class Offline_Fixation_Detector(Fixation_Detector_Base):
             recent = [d for d in self.bg_task.fetch()]
             if recent:
                 progress, data = zip(*recent)
-                self.fixations.extend(chain(*data))
+                self.fixations.extend(chain.from_iterable(data))
                 self.status = progress[-1]
                 if self.fixations:
                     current = self.fixations[-1]['timestamp']
@@ -344,7 +366,7 @@ class Offline_Fixation_Detector(Fixation_Detector_Base):
         if not frame:
             return
 
-        self.last_frame_ts = frame.timestamp
+        self.last_frame_idx = frame.index
         events['fixations'] = self.g_pool.fixations_by_frame[frame.index]
         if self.show_fixations:
             for f in self.g_pool.fixations_by_frame[frame.index]:
@@ -436,7 +458,7 @@ class Offline_Fixation_Detector(Fixation_Detector_Base):
             logger.warning('No fixations in this recording nothing to export')
             return
 
-        fixations_in_section = chain(*self.g_pool.fixations_by_frame[slice(*export_range)])
+        fixations_in_section = chain.from_iterable(self.g_pool.fixations_by_frame[slice(*export_range)])
         fixations_in_section = list(dict([(f['id'], f) for f in fixations_in_section]).values()) # remove duplicates
         fixations_in_section.sort(key=lambda f: f['id'])
 
@@ -475,6 +497,8 @@ class Fixation_Detector(Fixation_Detector_Base):
 
     The Offline Fixation Detector yields fixations that do not overlap.
     '''
+    order = .19
+
     def __init__(self, g_pool, max_dispersion=3.0, min_duration=300, confidence_threshold=0.75):
         super().__init__(g_pool)
         self.queue = deque()
@@ -487,7 +511,7 @@ class Fixation_Detector(Fixation_Detector_Base):
         events['fixations'] = []
         gaze = events['gaze_positions']
 
-        self.queue.extend((gp for gp in gaze if gp['confidence'] > self.confidence_threshold))
+        self.queue.extend((gp for gp in gaze if gp['confidence'] >= self.confidence_threshold))
 
         try:  # use newest gaze point to determine age threshold
             age_threshold = self.queue[-1]['timestamp'] - self.min_duration / 1000.

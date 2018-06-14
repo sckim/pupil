@@ -69,8 +69,8 @@ cdef class Detector_2D:
             self.detectProperties["canny_treshold"] = 160
             self.detectProperties["canny_ration"] = 2
             self.detectProperties["canny_aperture"] = 5
-            self.detectProperties["pupil_size_max"] = 200
-            self.detectProperties["pupil_size_min"] = 20
+            self.detectProperties["pupil_size_max"] = 150
+            self.detectProperties["pupil_size_min"] = 10
             self.detectProperties["strong_perimeter_ratio_range_min"] = 0.6
             self.detectProperties["strong_perimeter_ratio_range_max"] = 1.1
             self.detectProperties["strong_area_ratio_range_min"] = 0.8
@@ -81,6 +81,7 @@ cdef class Detector_2D:
             self.detectProperties["final_perimeter_ratio_range_min"] = 0.5
             self.detectProperties["final_perimeter_ratio_range_max"] = 1.0
             self.detectProperties["ellipse_true_support_min_dist"] = 3.0
+            self.detectProperties["support_pixel_ratio_exponent"] = 2.0
 
     def get_settings(self):
         return self.detectProperties
@@ -130,7 +131,7 @@ cdef class Detector_2D:
         roi_height  = roi.get()[3] - roi.get()[1]
         cdef int[:,::1] integral
 
-        if self.detectProperties['coarse_detection'] and image_width > 200:
+        if self.detectProperties['coarse_detection'] and roi_width*roi_height > 320*240:
             scale = 2 # half the integral image. boost up integral
             # TODO maybe implement our own Integral so we don't have to half the image
             user_roi_image = frame_.gray[user_roi.view]

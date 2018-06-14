@@ -93,6 +93,8 @@ def service(timebase, eyes_are_alive, ipc_pub_url, ipc_sub_url, ipc_push_url, us
         from calibration_routines import calibration_plugins, gaze_mapping_plugins
         from pupil_remote import Pupil_Remote
         from pupil_groups import Pupil_Groups
+        from frame_publisher import Frame_Publisher
+        from blink_detection import Blink_Detection
         from service_ui import Service_UI
 
         logger.info('Application Version: {}'.format(version))
@@ -118,7 +120,7 @@ def service(timebase, eyes_are_alive, ipc_pub_url, ipc_sub_url, ipc_push_url, us
 
         # manage plugins
         runtime_plugins = import_runtime_plugins(os.path.join(g_pool.user_dir, 'plugins'))
-        user_launchable_plugins = [Service_UI, Pupil_Groups, Pupil_Remote]+runtime_plugins
+        user_launchable_plugins = [Service_UI, Pupil_Groups, Pupil_Remote, Frame_Publisher, Blink_Detection]+runtime_plugins
         plugin_by_index = runtime_plugins+calibration_plugins+gaze_mapping_plugins+user_launchable_plugins
         name_by_index = [p.__name__ for p in plugin_by_index]
         plugin_by_name = dict(zip(name_by_index, plugin_by_index))
@@ -136,6 +138,7 @@ def service(timebase, eyes_are_alive, ipc_pub_url, ipc_sub_url, ipc_push_url, us
             logger.info("Session setting are from older version of this app. I will not use those.")
             session_settings.clear()
 
+        g_pool.min_calibration_confidence = session_settings.get('min_calibration_confidence', 0.8)
         g_pool.detection_mapping_mode = session_settings.get('detection_mapping_mode', '2d')
         g_pool.active_calibration_plugin = None
         g_pool.active_gaze_mapping_plugin = None
@@ -212,6 +215,7 @@ def service(timebase, eyes_are_alive, ipc_pub_url, ipc_sub_url, ipc_push_url, us
         session_settings['version'] = str(g_pool.version)
         session_settings['eye0_process_alive'] = eyes_are_alive[0].value
         session_settings['eye1_process_alive'] = eyes_are_alive[1].value
+        session_settings['min_calibration_confidence'] = g_pool.min_calibration_confidence
         session_settings['detection_mapping_mode'] = g_pool.detection_mapping_mode
         session_settings['audio_mode'] = audio.audio_mode
         session_settings.close()

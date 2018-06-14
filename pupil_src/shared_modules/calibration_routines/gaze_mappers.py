@@ -60,15 +60,11 @@ class Monocular_Gaze_Mapper_Base(Gaze_Mapping_Plugin):
     """Base class to implement the map callback"""
     def __init__(self, g_pool):
         super().__init__(g_pool)
-        self.min_pupil_confidence = 0.0
 
     def on_pupil_datum(self, p):
-        if p['confidence'] >= self.min_pupil_confidence:
-            g = self._map_monocular(p)
-            if g:
-                return [g,]
-            else:
-                return []
+        g = self._map_monocular(p)
+        if g:
+            return [g]
         else:
             return []
 
@@ -94,10 +90,17 @@ class Binocular_Gaze_Mapper_Base(Gaze_Mapping_Plugin):
         return results
 
     def on_pupil_datum(self, p):
-        if p['confidence'] >= self.min_pupil_confidence:
-            self._caches[p['id']].append(p)
+        self._caches[p['id']].append(p)
 
-        if self._caches[0] and self._caches[1]:
+        # map low confidence pupil data monocularly
+        if self._caches[0] and self._caches[0][0]['confidence'] < self.min_pupil_confidence:
+            p = self._caches[0].popleft()
+            gaze_datum = self._map_monocular(p)
+        elif self._caches[1] and self._caches[1][0]['confidence'] < self.min_pupil_confidence:
+            p = self._caches[1].popleft()
+            gaze_datum = self._map_monocular(p)
+        # map high confidence data binocularly if available
+        elif self._caches[0] and self._caches[1]:
             # we have binocular data
             if self._caches[0][0]['timestamp'] < self._caches[1][0]['timestamp']:
                 p0 = self._caches[0].popleft()
@@ -109,7 +112,7 @@ class Binocular_Gaze_Mapper_Base(Gaze_Mapping_Plugin):
                 older_pt = p1
 
             if abs(p0['timestamp'] - p1['timestamp']) < self.temportal_cutoff:
-                gaze_datum = self._map_binocular(p0,p1)
+                gaze_datum = self._map_binocular(p0, p1)
             else:
                 gaze_datum = self._map_monocular(older_pt)
 
@@ -123,7 +126,7 @@ class Binocular_Gaze_Mapper_Base(Gaze_Mapping_Plugin):
             gaze_datum = None
 
         if gaze_datum:
-            return [gaze_datum,]
+            return [gaze_datum]
         else:
             return []
 
@@ -134,7 +137,7 @@ class Dummy_Gaze_Mapper(Monocular_Gaze_Mapper_Base, Gaze_Mapping_Plugin):
         super().__init__(g_pool)
 
     def _map_monocular(self, p):
-        return {'topic': 'gaze.2d.{}'.format(p['id']),
+        return {'topic': 'gaze.2d.{}.'.format(p['id']),
                 'norm_pos': p['norm_pos'],
                 'confidence': p['confidence'],
                 'timestamp': p['timestamp'],
@@ -158,7 +161,7 @@ class Monocular_Gaze_Mapper(Monocular_Gaze_Mapper_Base, Gaze_Mapping_Plugin):
 
     def _map_monocular(self, p):
         gaze_point = self.map_fn(p['norm_pos'])
-        return {'topic': 'gaze.2d.{}'.format(p['id']),
+        return {'topic': 'gaze.2d.{}.'.format(p['id']),
                 'norm_pos': gaze_point,
                 'confidence': p['confidence'],
                 'id': p['id'],
@@ -180,7 +183,7 @@ class Dual_Monocular_Gaze_Mapper(Monocular_Gaze_Mapper_Base, Gaze_Mapping_Plugin
 
     def _map_monocular(self, p):
         gaze_point = self.map_fns[p['id']](p['norm_pos'])
-        return {'topic': 'gaze.2d.{}'.format(p['id']),
+        return {'topic': 'gaze.2d.{}.'.format(p['id']),
                 'norm_pos': gaze_point,
                 'confidence': p['confidence'],
                 'id': p['id'],
@@ -221,7 +224,7 @@ class Binocular_Gaze_Mapper(Binocular_Gaze_Mapper_Base, Gaze_Mapping_Plugin):
                           (gaze_point_eye0[1] + gaze_point_eye1[1])/2.)
         confidence = (p0['confidence'] + p1['confidence'])/2.
         ts = (p0['timestamp'] + p1['timestamp'])/2.
-        return {'topic': 'gaze.2d.2',
+        return {'topic': 'gaze.2d.01.',
                 'norm_pos': gaze_point,
                 'confidence': confidence,
                 'timestamp': ts,
@@ -229,7 +232,7 @@ class Binocular_Gaze_Mapper(Binocular_Gaze_Mapper_Base, Gaze_Mapping_Plugin):
 
     def _map_monocular(self, p):
         gaze_point = self.map_fn_fallback[p['id']](p['norm_pos'])
-        return {'topic': 'gaze.2d.2',
+        return {'topic': 'gaze.2d.{}.'.format(p['id']),
                 'norm_pos': gaze_point,
                 'confidence': p['confidence'],
                 'timestamp': p['timestamp'],
@@ -294,7 +297,7 @@ class Vector_Gaze_Mapper(Monocular_Gaze_Mapper_Base,Gaze_Mapping_Plugin):
         gaze_3d = self.toWorld(gaze_point)
         normal_3d = np.dot( self.rotation_matrix, np.array( p['circle_3d']['normal'] ) )
 
-        g = {   'topic': 'gaze.2d.2',
+        g = {   'topic': 'gaze.3d.{}.'.format(p['id']),
                 'norm_pos': image_point,
                 'eye_center_3d': eye_center.tolist(),
                 'gaze_normal_3d': normal_3d.tolist(),
@@ -407,7 +410,7 @@ class Binocular_Vector_Gaze_Mapper(Binocular_Gaze_Mapper_Base,Gaze_Mapping_Plugi
 
         normal_3d = self.rotation_matricies[p_id] @ np.array(p['circle_3d']['normal'])
 
-        g = {'topic': 'gaze.3d.2',
+        g = {'topic': 'gaze.3d.{}.'.format(p_id),
              'eye_centers_3d': {p['id']: eye_center.tolist()},
              'gaze_normals_3d': {p['id']: normal_3d.tolist()},
              'gaze_point_3d': gaze_3d.tolist(),
@@ -490,7 +493,7 @@ class Binocular_Vector_Gaze_Mapper(Binocular_Gaze_Mapper_Base,Gaze_Mapping_Plugi
 
         confidence = min(p0['confidence'],p1['confidence'])
         ts = (p0['timestamp'] + p1['timestamp'])/2.
-        g = {'topic': 'gaze.3d.2',
+        g = {'topic': 'gaze.3d.01.',
              'eye_centers_3d': {0: s0_center.tolist(), 1: s1_center.tolist()},
              'gaze_normals_3d': {0: s0_normal.tolist(), 1: s1_normal.tolist()},
              'gaze_point_3d': nearest_intersection_point.tolist(),

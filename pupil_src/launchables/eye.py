@@ -88,7 +88,7 @@ def eye(timebase, is_alive_flag, ipc_pub_url, ipc_sub_url, ipc_push_url,
     logging.getLogger("OpenGL").setLevel(logging.ERROR)
     logger = logging.getLogger()
     logger.handlers = []
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.NOTSET)
     logger.addHandler(zmq_tools.ZMQ_handler(zmq_ctx, ipc_push_url))
     # create logger for the context of this function
     logger = logging.getLogger(__name__)
@@ -138,7 +138,7 @@ def eye(timebase, is_alive_flag, ipc_pub_url, ipc_sub_url, ipc_push_url,
             window_position_default = (600, 300 * eye_id + 30)
         elif platform.system() == 'Windows':
             scroll_factor = 10.0
-            window_position_default = (600, 31 + 300 * eye_id)
+            window_position_default = (600, 90 + 300 * eye_id)
         else:
             scroll_factor = 1.0
             window_position_default = (600, 300 * eye_id)
@@ -173,7 +173,7 @@ def eye(timebase, is_alive_flag, ipc_pub_url, ipc_sub_url, ipc_push_url,
 
             active_window = glfw.glfwGetCurrentContext()
             glfw.glfwMakeContextCurrent(window)
-            hdpi_factor = float(glfw.glfwGetFramebufferSize(window)[0] / glfw.glfwGetWindowSize(window)[0])
+            hdpi_factor = glfw.getHDPIFactor(window)
             g_pool.gui.scale = g_pool.gui_user_scale * hdpi_factor
             window_size = w, h
             camera_render_size = w-int(icon_bar_width*g_pool.gui.scale), h
@@ -237,8 +237,8 @@ def eye(timebase, is_alive_flag, ipc_pub_url, ipc_sub_url, ipc_push_url,
             'capture_manager_settings', ('UVC_Manager',{}))
 
         manager_class_name, manager_settings = capture_manager_settings
-        manager_class_by_name = {c.__name__:c for c in manager_classes}
-        g_pool.capture_manager = manager_class_by_name[manager_class_name](g_pool,**manager_settings)
+        manager_class_by_name = {c.__name__: c for c in manager_classes}
+        g_pool.capture_manager = manager_class_by_name[manager_class_name](g_pool, **manager_settings)
 
         if eye_id == 0:
             cap_src = ["Pupil Cam2 ID0", "Pupil Cam1 ID0", "HD-6000"]
@@ -249,7 +249,7 @@ def eye(timebase, is_alive_flag, ipc_pub_url, ipc_sub_url, ipc_push_url,
         default_settings = ('UVC_Source', {
                             'preferred_names': cap_src,
                             'frame_size': (320, 240),
-                            'frame_rate': 90
+                            'frame_rate': 120
                             })
 
         capture_source_settings = overwrite_cap_settings or session_settings.get('capture_settings', default_settings)
@@ -297,12 +297,10 @@ def eye(timebase, is_alive_flag, ipc_pub_url, ipc_sub_url, ipc_push_url,
         width *= 2
         height *= 2
         width += icon_bar_width
+        width, height = session_settings.get('window_size', (width, height))
 
-        width, height = session_settings.get(
-            'window_size', (width, height))
         main_window = glfw.glfwCreateWindow(width, height, title, None, None)
-        window_pos = session_settings.get(
-            'window_position', window_position_default)
+        window_pos = session_settings.get('window_position', window_position_default)
         glfw.glfwSetWindowPos(main_window, window_pos[0], window_pos[1])
         glfw.glfwMakeContextCurrent(main_window)
         cygl.utils.init()
@@ -403,7 +401,10 @@ def eye(timebase, is_alive_flag, ipc_pub_url, ipc_sub_url, ipc_push_url,
             g_pool.capture.init_ui()
             if g_pool.writer:
                 logger.info("Done recording.")
-                g_pool.writer.release()
+                try:
+                    g_pool.writer.release()
+                except RuntimeError:
+                    logger.error('No eye video recorded')
                 g_pool.writer = None
 
         g_pool.replace_source = replace_source # for ndsi capture
@@ -444,6 +445,7 @@ def eye(timebase, is_alive_flag, ipc_pub_url, ipc_sub_url, ipc_push_url,
 
         should_publish_frames = False
         frame_publish_format = 'jpeg'
+        frame_publish_format_recent_warning = False
 
         # create a timer to control window update frequency
         window_update_timer = timer(1 / 60)
@@ -495,7 +497,10 @@ def eye(timebase, is_alive_flag, ipc_pub_url, ipc_sub_url, ipc_push_url,
                 elif subject == 'recording.stopped':
                     if g_pool.writer:
                         logger.info("Done recording.")
-                        g_pool.writer.release()
+                        try:
+                            g_pool.writer.release()
+                        except RuntimeError:
+                            logger.error('No eye video recorded')
                         g_pool.writer = None
                 elif subject.startswith('meta.should_doc'):
                     ipc_socket.notify({
@@ -534,11 +539,13 @@ def eye(timebase, is_alive_flag, ipc_pub_url, ipc_sub_url, ipc_push_url,
                             data = frame.bgr
                         elif frame_publish_format == "gray":
                             data = frame.gray
-                        else:
-                            raise AttributeError()
-                    except AttributeError:
-                        pass
+                        assert data is not None
+                    except (AttributeError, AssertionError, NameError):
+                        if not frame_publish_format_recent_warning:
+                            frame_publish_format_recent_warning = True
+                            logger.warning('{}s are not compatible with format "{}"'.format(type(frame), frame_publish_format))
                     else:
+                        frame_publish_format_recent_warning = False
                         pupil_socket.send('frame.eye.%s'%eye_id,{
                             'width': frame.width,
                             'height': frame.height,
@@ -659,11 +666,15 @@ def eye(timebase, is_alive_flag, ipc_pub_url, ipc_sub_url, ipc_push_url,
         session_settings['ui_config'] = g_pool.gui.configuration
         session_settings['capture_settings'] = g_pool.capture.class_name, g_pool.capture.get_init_dict()
         session_settings['capture_manager_settings'] = g_pool.capture_manager.class_name, g_pool.capture_manager.get_init_dict()
-        session_settings['window_size'] = glfw.glfwGetWindowSize(main_window)
         session_settings['window_position'] = glfw.glfwGetWindowPos(main_window)
         session_settings['version'] = str(g_pool.version)
         session_settings['last_pupil_detector'] = g_pool.pupil_detector.__class__.__name__
         session_settings['pupil_detector_settings'] = g_pool.pupil_detector.get_settings()
+
+        session_window_size = glfw.glfwGetWindowSize(main_window)
+        if 0 not in session_window_size:
+            session_settings['window_size'] = session_window_size
+
         session_settings.close()
 
         g_pool.capture.deinit_ui()
